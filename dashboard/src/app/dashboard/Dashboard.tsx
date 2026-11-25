@@ -1,0 +1,300 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import type { HuntEvent } from "@/lib/events";
+import { elapsedSince, formatClock, formatDuration } from "@/lib/format";
+
+export interface SolvedRound {
+  slug: string;
+  solvedAt: string;
+  markedBy: "team" | "admin";
+  /** Cumulative clock at this solve — the number the next round continues from. */
+  elapsedMs?: number | null;
+  /** Time spent on this round alone. */
+  splitMs?: number | null;
+  order?: number | null;
+}
+
+/**
+ * The five rounds, for one registered team.
+ *
+ * THIS BOARD IS READ-ONLY. It reports what the server has stamped; it cannot
+ * stamp anything itself.
+ *
+ * There used to be a "Mark complete" button on every unsolved tile, calling
+ * `POST /api/team/progress`. It was a hole: all five rounds already stamp
+ * themselves the moment the server verifies a real solve — the circuit on its
+ * fifth board, the grid and the room on their answers, Shift Verse on its
+ * guess, the blueprint on its final checkpoint — so the button's only remaining
+ * power was to credit a round a team had NOT played. Five taps finished the
+ * hunt without opening a puzzle, and the resulting row was indistinguishable
+ * from an honest one apart from a `markedBy` of "team".
+ *
+ * Corrections are a coordinator's job on the admin board (`/api/admin/progress`,
+ * which is the only route that still writes a stamp on request). The endpoint
+ * behind the old button is gone, not merely unlinked — hiding a button that a
+ * `curl` could still reach would have been decoration.
+ *
+ * The running clock ticks client-side from `registeredAt` rather than being
+ * pushed from the server, so it stays smooth without a request per second. Once
+ * the team finishes it freezes at the stored duration — the server's number,
+ * not the browser's, so every screen agrees on the result.
+ */
+export default function Dashboard({
+  teamNumber,
+  members,
+  events,
+  solved: initialSolved,
+  registeredAt,
+  completedAt: initialCompletedAt,
+  durationMs: initialDurationMs,
+  degraded,
+}: {
+  teamNumber: number;
+  members: string[];
+  events: HuntEvent[];
+  solved: SolvedRound[];
+  registeredAt: string | null;
+  completedAt: string | null;
+  durationMs: number | null;
+  degraded: boolean;
+}) {
+  const [open, setOpen] = useState<string | null>(null);
+  const [now, setNow] = useState<number | null>(null);
+
+  /* Straight from the server render. These were `useState` setters when the
+     board could stamp a round and had to fold the response back in; with the
+     button gone nothing on this page mutates them, and a reload is what shows
+     a newly-cleared round. */
+  const solved = initialSolved;
+  const completedAt = initialCompletedAt;
+  const durationMs = initialDurationMs;
+
+  const byslug = new Map(solved.map((s) => [s.slug, s]));
+  const finished = completedAt !== null;
+
+  /* The clock. Starts as null and is only set in an effect so the server-
+     rendered HTML and the first client render agree — reading Date.now()
+     during render is a hydration mismatch waiting to happen. */
+  useEffect(() => {
+    if (finished) return;
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [finished]);
+
+  const earned = events.reduce((sum, e) => sum + (byslug.has(e.slug) ? e.points : 0), 0);
+  const total = events.reduce((sum, e) => sum + e.points, 0);
+
+  const runningMs =
+    finished || !registeredAt || now === null ? durationMs : elapsedSince(registeredAt, now);
+
+  async function signOut() {
+    await fetch("/api/team/logout", { method: "POST" });
+    window.location.href = "/";
+  }
+
+  return (
+    <main className="min-h-dvh px-5 py-10">
+      <div className="mx-auto max-w-3xl">
+        {/* ── Masthead ──────────────────────────────────────────────────── */}
+        <header className="anim-rise flex flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-3">
+              <span className="tag tag-accent">XPLORE&apos;26</span>
+              <span className="label">Team board</span>
+            </div>
+            <h1 className="display mt-4 text-4xl text-ink sm:text-5xl">Treasure Hunt</h1>
+          </div>
+
+          <div className="slab-flat shrink-0 px-5 py-3 text-center">
+            <span className="label block">Team</span>
+            <span className="display mt-1 block text-4xl tabular text-accent-ink">
+              {String(teamNumber).padStart(2, "0")}
+            </span>
+          </div>
+        </header>
+
+        <hr className="rule-line mt-4" />
+
+        {members.length > 0 && (
+          <p className="anim-rise mt-3 font-mono text-xs text-ink-2">{members.join("  ·  ")}</p>
+        )}
+
+        {/* ── Score strip ───────────────────────────────────────────────── */}
+        <section className="anim-rise mt-6 grid gap-px border-2 border-rule bg-rule sm:grid-cols-3">
+          <Stat label="Points" value={String(earned)} sub={`of ${total}`} />
+          <Stat label="Rounds cleared" value={String(byslug.size)} sub={`of ${events.length}`} />
+          <Stat
+            label={finished ? "Final time" : "Elapsed"}
+            value={runningMs === null ? "—" : formatDuration(runningMs)}
+            accent={finished}
+          />
+        </section>
+
+        <div className="anim-rise mt-4 flex justify-end">
+          <button onClick={() => void signOut()} className="btn">
+            Sign out
+          </button>
+        </div>
+
+        {/* ── The consolidated finish ───────────────────────────────────── */}
+        {finished && (
+          <section className="slab slab-good anim-pop mt-6 p-5">
+            <p className="display text-lg text-good">All five rounds cleared</p>
+            <p className="mt-1 font-mono text-xs text-ink-2">
+              Finished {formatClock(completedAt)} · total {formatDuration(durationMs)}
+            </p>
+          </section>
+        )}
+
+        {degraded && (
+          <p className="anim-rise mt-4 font-mono text-xs text-warn">
+            Couldn&apos;t read progress — rounds may show as unsolved.
+          </p>
+        )}
+
+        {/* ── Round list ────────────────────────────────────────────────── */}
+        <h2 className="label mt-10">Rounds</h2>
+        <hr className="rule-line mt-2" />
+
+        <ul className="mt-4 grid gap-3">
+          {events.map((e, i) => {
+            const row = byslug.get(e.slug);
+            const isSolved = row !== undefined;
+            const isOpen = open === e.slug;
+
+            return (
+              <li key={e.slug} className="anim-rise">
+                <div className={`slab ${isSolved ? "slab-good" : ""}`}>
+                  <button
+                    onClick={() => setOpen(isOpen ? null : e.slug)}
+                    aria-expanded={isOpen}
+                    className="flex w-full items-center gap-4 p-4 text-left hover:bg-accent-wash"
+                  >
+                    {/* Rounds are told apart by number, not by colour. */}
+                    <span
+                      className={`display flex h-11 w-11 shrink-0 items-center justify-center border-2 border-rule text-lg tabular ${
+                        isSolved ? "bg-good text-white" : "bg-paper-2 text-ink"
+                      }`}
+                    >
+                      {String(i + 1).padStart(2, "0")}
+                    </span>
+
+                    <div className="min-w-0 flex-1">
+                      <span className="display block truncate text-lg text-ink">{e.title}</span>
+                      <span className="mt-0.5 block truncate font-mono text-xs text-ink-3">
+                        {/* The cumulative clock, not the time of day — this is
+                            the number the next round continues from. */}
+                        {isSolved
+                          ? `Cleared at ${formatDuration(row.elapsedMs ?? null)}`
+                          : e.tagline}
+                      </span>
+                    </div>
+
+                    <span className={`tag shrink-0 ${isSolved ? "tag-good" : "tag-muted"}`}>
+                      {isSolved ? "Solved" : `${e.points} pts`}
+                    </span>
+                  </button>
+
+                  {isOpen && (
+                    <div className="anim-pop border-t-2 border-rule px-4 pb-4 pt-4">
+                      <p className="text-sm leading-relaxed text-ink-2">{e.blurb}</p>
+
+                      {isSolved && (
+                        <div className="mt-3 grid gap-px border-2 border-rule bg-rule sm:grid-cols-3">
+                          <MiniStat label="Stamped" value={formatClock(row.solvedAt)} />
+                          <MiniStat label="Time on round" value={formatDuration(row.splitMs ?? null)} />
+                          <MiniStat label="Clock read" value={formatDuration(row.elapsedMs ?? null)} strong />
+                          {row.markedBy === "admin" && (
+                            <p className="bg-card px-3 py-2 font-mono text-[0.7rem] text-ink-3 sm:col-span-3">
+                              Stamped by a coordinator.
+                            </p>
+                          )}
+                        </div>
+                      )}
+
+                      <div className="mt-4 flex flex-wrap items-center gap-3">
+                        {e.href && (
+                          <a href={e.href} className="btn btn-accent">
+                            {isSolved ? "Revisit round" : "Enter round"}
+                          </a>
+                        )}
+
+                        {isSolved && <span className="tag tag-good">Complete</span>}
+
+                        <span className="ml-auto font-mono text-[0.7rem] text-ink-3">
+                          {e.slug}
+                        </span>
+                      </div>
+
+                      {!isSolved && (
+                        <p className="mt-3 font-mono text-[0.7rem] text-ink-3">
+                          This round marks itself the moment the server verifies your
+                          answer — there is nothing to tick off here. If it stays
+                          unsolved after you have finished it, ask a coordinator.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+
+        <hr className="rule-line-soft mt-10" />
+        <p className="mt-3 text-center font-mono text-[0.7rem] text-ink-3">
+          Your number is yours for the day. Signing out does not release it.
+        </p>
+      </div>
+    </main>
+  );
+}
+
+/** A single figure inside an expanded round tile. */
+function MiniStat({
+  label,
+  value,
+  strong = false,
+}: {
+  label: string;
+  value: string;
+  strong?: boolean;
+}) {
+  return (
+    <div className="bg-card px-3 py-2">
+      <span className="label block">{label}</span>
+      <span
+        className={`mt-0.5 block font-mono text-sm tabular ${
+          strong ? "font-bold text-accent-ink" : "text-ink-2"
+        }`}
+      >
+        {value}
+      </span>
+    </div>
+  );
+}
+
+/** One cell of the score strip. The 1px gaps come from the parent's bg-rule. */
+function Stat({
+  label,
+  value,
+  sub,
+  accent = false,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+  accent?: boolean;
+}) {
+  return (
+    <div className="bg-card p-4">
+      <span className="label block">{label}</span>
+      <p className="mt-1 flex items-baseline gap-2">
+        <span className={`stat-value ${accent ? "text-accent-ink" : "text-ink"}`}>{value}</span>
+        {sub && <span className="font-mono text-xs text-ink-3">{sub}</span>}
+      </p>
+    </div>
+  );
+}
